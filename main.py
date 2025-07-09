@@ -2,6 +2,7 @@ from typing import TypeVar, Generic, TYPE_CHECKING, Any
 from uuid import UUID
 from collections.abc import Sequence
 import uvicorn
+from starlette.status import HTTP_200_OK, HTTP_201_CREATED
 from fastapi import FastAPI, HTTPException, Query, Depends, APIRouter
 from pydantic import BaseModel
 from typing import Optional, List
@@ -144,7 +145,11 @@ class ReviewService:
         return reviews
 
 
-@router.post("/reviews", response_model=ReviewResponse)
+@router.post(
+    path="/reviews",
+    response_model=ReviewResponse,
+    status_code=HTTP_201_CREATED,
+)
 async def create_review(
         review: ReviewRequest,
         service: ReviewService = Depends(),
@@ -161,7 +166,11 @@ async def create_review(
         )
 
 
-@router.get("/reviews", response_model=List[ReviewResponse])
+@router.get(
+    path="/reviews",
+    response_model=List[ReviewResponse],
+    status_code=HTTP_200_OK,
+)
 async def get_reviews(
         sentiment: Optional[str] = Query(None),
         service: ReviewService = Depends(),
