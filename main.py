@@ -1,25 +1,30 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, APIRouter
+from fastapi import FastAPI, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, UTC
+from enum import Enum
+from sqlalchemy import String, Integer, DateTime
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
-from sqlalchemy import Integer, String, DateTime, create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.future import select
+from contextlib import asynccontextmanager
 
 
 # db config
-DATABASE_URL = "sqlite:///./reviews.db"
+DATABASE_URL = "sqlite+aiosqlite:///./reviews.db"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-# keywords
-positive_keywords = ["хорош", "люблю", "отличн", "прекрасн", "нравит"]
-negative_keywords = ["плох", "ненавиж", "ужас", "не работа"]
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
-# Models in db fo positive and negative reviews
+# keywords enum
+class SentimentEnum(str, Enum):
+    positive = "positive"
+    negative = "negative"
+    neutral = "neutral"
+
+
+# Base class for ORM
 class Base(DeclarativeBase):
     pass
 
@@ -48,54 +53,87 @@ class ReviewResponse(BaseModel):
         from_attributes = True
 
 
-# db session dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Dependency for DB session
+async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
 
 
-def detect_sentiment(text: str) -> str:
-    """
-    Detects if the review is positive, negative or neutral.
-    """
-    lower_text = text.lower()
-    if any(word in lower_text for word in positive_keywords):
-        return "positive"
-    elif any(word in lower_text for word in negative_keywords):
-        return "negative"
-    return "neutral"
+class SentimentAnalyzer:
+    def __init__(self):
+        self.positive_keywords = ["хорош", "люблю", "отличн", "прекрасн", "нравит"]
+        self.negative_keywords = ["плох", "ненавиж", "ужас", "не работа"]
+
+    def analyze(self, text: str) -> SentimentEnum:
+        lower_text = text.lower()
+        match lower_text:
+            case _ if any(word in lower_text for word in self.positive_keywords):
+                return SentimentEnum.positive
+            case _ if any(word in lower_text for word in self.negative_keywords):
+                return SentimentEnum.negative
+            case _:
+                return SentimentEnum.neutral
 
 
-app = FastAPI()
-Base.metadata.create_all(bind=engine)
+# Dependency
+def get_sentiment_analyzer():
+    return SentimentAnalyzer()
+
+
+# Repository
+class ReviewRepository:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create_review(self, text: str, sentiment: str) -> Review:
+        review = Review(text=text, sentiment=sentiment)
+        self.db.add(review)
+        await self.db.commit()
+        await self.db.refresh(review)
+        return review
+
+    async def get_reviews(self, sentiment: Optional[str] = None) -> List[Review]:
+        stmt = select(Review)
+        if sentiment:
+            stmt = stmt.where(Review.sentiment == sentiment)
+        result = await self.db.execute(stmt)
+        return result.scalars().all()
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
+# FastAPI app
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/reviews", response_model=ReviewResponse)
-def create_review(review: ReviewRequest, db: Session = Depends(get_db)):
+async def create_review(
+    review: ReviewRequest,
+    db: AsyncSession = Depends(get_db),
+    analyzer: SentimentAnalyzer = Depends(get_sentiment_analyzer)
+):
     """
     Receives review from client. Writes reviews to database.
     """
-    sentiment = detect_sentiment(review.text)
-
-    db_review = Review(text=review.text, sentiment=sentiment)
-    db.add(db_review)
-    db.commit()
-    db.refresh(db_review)
-
-    return db_review
+    sentiment = analyzer.analyze(review.text).value
+    repository = ReviewRepository(db)
+    saved_review = await repository.create_review(review.text, sentiment)
+    return saved_review
 
 
 @app.get("/reviews", response_model=List[ReviewResponse])
-def get_reviews(sentiment: Optional[str] = Query(None), db: Session = Depends(get_db)):
+async def get_reviews(
+    sentiment: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
     """
     Retrieve a list of reviews from the database.
     """
-    query = db.query(Review)
-    if sentiment:
-        query = query.filter(Review.sentiment == sentiment)
-    return query.all()
-
-
+    repository = ReviewRepository(db)
+    return await repository.get_reviews(sentiment)
